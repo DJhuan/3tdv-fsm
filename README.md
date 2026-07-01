@@ -21,6 +21,15 @@ python 3tdv.py -h
 ```
 
 Você também pode usar o `degrate_and_evaluate.sh` indicando a pasta com arquivos `.wav` e a pasta de saída.
+‼️ Lembrando que tanto o `AutoTesting` quanto o `degrate_and_evaluate.sh` foram criados usando IA ‼️
+
+O Teste 4 foi otimizado para usar uma grade reduzida por padrão, com execução paralela via múltiplos processos. Se quiser o comportamento exaustivo antigo, use `--test4-mode full`.
+
+Exemplo em lote:
+
+```sh
+./degrate_and_evaluate.sh 3tdv.py /caminho/para/pesq ./results entrada1.wav entrada2.wav -- --test4-mode reduced-grid --repetitions 3
+```
 
 ## ⚠️ Aviso
 

@@ -10,24 +10,125 @@ Tipos de teste:
 Uso:
     python 3tdvAutoTesting.py caminho_3tdv executavel_PESQ entrada.wav [opções]
     --output-dir       Diretório para salvar os resultados (padrão: ./results)
-    --save-degraded    Salvar os arquivos degradados (padrão: False)
     --skip-tests       Lista de tipos de teste a pular (ex.: --skip-tests 2 4)
 """
 
-import subprocess
-import matplotlib.pyplot as plt
 import argparse
-import os
 import csv
-import sys 
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from itertools import product
 
-JITTER_MAX_MS = [0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0]
+import matplotlib.pyplot as plt
+
+JITTER_MAX_MS = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 2.0]
 
 P_LOSS_GB = [0.01, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15, 0.20, 0.30]
 P_LOSS_BB = [0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99]
 
-BER = [1e-7, 1e-6, 5e-6, 8e-6, 1e-5, 2e-5, 5e-5, 8e-5, 1e-4, 5e-4, 1e-3]
+BER = [1.00000000e-07, 2.78255940e-07, 7.74263683e-07, 2.15443469e-06,
+        5.99484250e-06, 1.66810054e-05, 4.64158883e-05, 1.29154967e-04, 3.59381366e-04, 1.00000000e-03]
 DEFAULT_REPETITIONS = 5
+DEFAULT_WORKERS = os.cpu_count() or 1
+DEFAULT_TEST4_GRID_LEVELS = 3
+DEFAULT_TEST4_LHS_SAMPLES = 81
+PESQ_DOUBLE_SCORE_PATTERN = re.compile(
+    r"P\.862 Prediction.*?(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE | re.DOTALL,
+)
+PESQ_MOS_LQO_PATTERN = re.compile(
+    r"MOS-LQO\D+(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _representative_values(values, levels=DEFAULT_TEST4_GRID_LEVELS):
+    """Seleciona valores baixos, médios e altos de uma lista ordenada."""
+    if not values:
+        return []
+
+    if len(values) <= levels:
+        return list(values)
+
+    if levels <= 1:
+        return [values[len(values) // 2]]
+
+    positions = {
+        round(index * (len(values) - 1) / (levels - 1))
+        for index in range(levels)
+    }
+    return [values[index] for index in sorted(positions)]
+
+
+def _build_test4_combinations(mode, grid_levels, lhs_samples, seed=42):
+    """Gera combinações para o Teste 4."""
+    if mode == "full":
+        return list(product(JITTER_MAX_MS, P_LOSS_GB, P_LOSS_BB, BER))
+
+    if mode == "lhs":
+        import random
+
+        rng = random.Random(seed)
+        samples = max(1, lhs_samples)
+
+        def sample_axis(values):
+            if len(values) <= 1:
+                return list(values) * samples
+
+            axis_samples = []
+            for index in range(samples):
+                start = index / samples
+                stop = (index + 1) / samples
+                pick = start + rng.random() * (stop - start)
+                axis_index = min(len(values) - 1, int(pick * len(values)))
+                axis_samples.append(values[axis_index])
+
+            rng.shuffle(axis_samples)
+            return axis_samples
+
+        jitter_samples = sample_axis(JITTER_MAX_MS)
+        p_gb_samples = sample_axis(P_LOSS_GB)
+        p_bb_samples = sample_axis(P_LOSS_BB)
+        ber_samples = sample_axis(BER)
+
+        combinations = list(zip(jitter_samples, p_gb_samples, p_bb_samples, ber_samples))
+        return combinations[:samples]
+
+    jitter_values = _representative_values(JITTER_MAX_MS, grid_levels)
+    p_gb_values = _representative_values(P_LOSS_GB, grid_levels)
+    p_bb_values = _representative_values(P_LOSS_BB, grid_levels)
+    ber_values = _representative_values(BER, grid_levels)
+
+    return list(product(jitter_values, p_gb_values, p_bb_values, ber_values))
+
+
+def _run_test4_case(task):
+    """Executa uma combinação do Teste 4 em um processo separado."""
+    input_file, ttdv_path, pesq_exe, combo = task
+    jitter, p_gb, p_bb, ber = combo
+
+    params = [
+        "--jitter-max-ms", str(jitter),
+        "--p-loss-gb", str(p_gb),
+        "--p-loss-bb", str(p_bb),
+        "--ber", str(ber),
+    ]
+
+    degraded = None
+    try:
+        degraded = run_degradation(input_file, ttdv_path, params)
+        if degraded is None:
+            return combo, None
+
+        pesq_score = run_pesq(degraded, input_file, pesq_exe)
+        return combo, pesq_score
+    finally:
+        if degraded and os.path.exists(degraded):
+            os.remove(degraded)
 
 
 def plot_results(results, output_dir, test_type):
@@ -135,34 +236,48 @@ def plot_results(results, output_dir, test_type):
 
 def run_degradation(input_file, ttdv_path, params):
     """Executa a degradação e retorna o arquivo de saída."""
-    output_file = input_file.replace(".wav", "_degraded.wav")
-    
-    cmd = f"python {ttdv_path} {input_file} {output_file} --no-report " + " ".join(params)
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    temp_created = False
+    output_file = None
+
+    if output_file is None:
+        file_descriptor, output_file = tempfile.mkstemp(prefix="3tdv_", suffix="_degraded.wav")
+        os.close(file_descriptor)
+        temp_created = True
+
+    cmd = [sys.executable, ttdv_path, input_file, output_file, "--no-report", *params]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     
     if result.returncode != 0:
         print(f"Erro ao degradar {input_file}: {result.stderr}", file=sys.stderr)
+        if temp_created and os.path.exists(output_file):
+            os.remove(output_file)
         return None
     
     return output_file
 
 def run_pesq(degraded_file, reference_file, pesq_exe):
     """Executa PESQ e retorna o score."""
-    cmd = f"{pesq_exe} +16000 {reference_file} {degraded_file}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    cmd = [pesq_exe, "+16000", reference_file, degraded_file]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     
     if result.returncode != 0:
         print(f"Erro ao executar PESQ: {result.stderr}", file=sys.stderr)
         return None
     
-    # Parsear a saída do PESQ para obter o score
-    for line in reversed(result.stdout.split('\n')):
-        if 'Prediction' in line or 'PESQ' in line:
-            try:
-                score = float(line.split()[-1])
-                return score
-            except (ValueError, IndexError):
-                continue
+    # Parse robusto: prioriza o MOS-LQO mapeado e faz fallback para linhas com MOS-LQO.
+    match = PESQ_DOUBLE_SCORE_PATTERN.search(result.stdout)
+    if match:
+        try:
+            return float(match.group(2))
+        except ValueError:
+            pass
+
+    match = PESQ_MOS_LQO_PATTERN.search(result.stdout.replace("\n", " "))
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
     
     return None
 
@@ -173,7 +288,7 @@ def run_mean_pesq_for_repetitions(input_file, ttdv_path, pesq_exe, base_params, 
 
     for rep in range(repetitions):
         params = list(base_params)
-        params.append(f"--seed {42 + rep}")
+        params.extend(["--seed", str(42 + rep)])
 
         degraded = run_degradation(input_file, ttdv_path, params)
         if degraded is None:
@@ -203,10 +318,10 @@ def test_type_1(input_file, ttdv_path, pesq_exe, output_dir, repetitions):
         print(f"  Testando Jitter: {jitter} ms (média de {repetitions})", end=" ... ")
         
         base_params = [
-            f"--jitter-max-ms {jitter}",
-            "--p-loss-gb 0",
-            "--p-loss-bb 0",
-            "--ber 0"
+            "--jitter-max-ms", str(jitter),
+            "--p-loss-gb", "0",
+            "--p-loss-bb", "0",
+            "--ber", "0",
         ]
         pesq_score = run_mean_pesq_for_repetitions(
             input_file=input_file,
@@ -237,10 +352,10 @@ def test_type_2(input_file, ttdv_path, pesq_exe, output_dir, repetitions):
             print(f"  Testando P(G→B)={p_gb}, P(B→B)={p_bb} (média de {repetitions})", end=" ... ")
             
             base_params = [
-                "--jitter-max-ms 0",
-                f"--p-loss-gb {p_gb}",
-                f"--p-loss-bb {p_bb}",
-                "--ber 0"
+                "--jitter-max-ms", "0",
+                "--p-loss-gb", str(p_gb),
+                "--p-loss-bb", str(p_bb),
+                "--ber", "0",
             ]
             pesq_score = run_mean_pesq_for_repetitions(
                 input_file=input_file,
@@ -271,10 +386,10 @@ def test_type_3(input_file, ttdv_path, pesq_exe, output_dir, repetitions):
         print(f"  Testando BER: {ber:.0e} (média de {repetitions})", end=" ... ")
         
         base_params = [
-            "--jitter-max-ms 0",
-            "--p-loss-gb 0",
-            "--p-loss-bb 0",
-            f"--ber {ber}"
+            "--jitter-max-ms", "0",
+            "--p-loss-gb", "0",
+            "--p-loss-bb", "0",
+            "--ber", str(ber),
         ]
         pesq_score = run_mean_pesq_for_repetitions(
             input_file=input_file,
@@ -292,45 +407,42 @@ def test_type_3(input_file, ttdv_path, pesq_exe, output_dir, repetitions):
     
     return results
 
-def test_type_4(input_file, ttdv_path, pesq_exe, output_dir):
+def test_type_4(input_file, ttdv_path, pesq_exe, output_dir, mode, grid_levels, lhs_samples, workers):
     """Teste Tipo 4: Variação combinada (todos os parâmetros)."""
     print("\n" + "="*60)
     print("TESTE TIPO 4: Variação Combinada (Todos os Parâmetros)")
     print("="*60)
     
     results = []
-    count = 0
-    total = len(JITTER_MAX_MS) * len(P_LOSS_GB) * len(P_LOSS_BB) * len(BER)
-    
-    for jitter in JITTER_MAX_MS:
-        for p_gb in P_LOSS_GB:
-            for p_bb in P_LOSS_BB:
-                for ber in BER:
-                    count += 1
-                    print(f"  [{count}/{total}] Jitter={jitter}ms, P(G→B)={p_gb}, P(B→B)={p_bb}, BER={ber:.0e}", end=" ... ")
-                    
-                    params = [
-                        f"--jitter-max-ms {jitter}",
-                        f"--p-loss-gb {p_gb}",
-                        f"--p-loss-bb {p_bb}",
-                        f"--ber {ber}"
-                    ]
-                    
-                    degraded = run_degradation(input_file, ttdv_path, params)
-                    if degraded is None:
-                        continue
-                    
-                    pesq_score = run_pesq(degraded, input_file, pesq_exe)
-                    
-                    if pesq_score is not None:
-                        results.append(((jitter, p_gb, p_bb, ber), pesq_score))
-                        print(f"PESQ: {pesq_score:.4f}")
-                    else:
-                        print("FALHA")
-                    
-                    # Remover arquivo degradado
-                    if os.path.exists(degraded):
-                        os.remove(degraded)
+    combinations = _build_test4_combinations(mode, grid_levels, lhs_samples)
+    total = len(combinations)
+
+    print(f"  Estratégia: {mode} | combinações: {total} | workers: {workers}")
+
+    tasks = [(input_file, ttdv_path, pesq_exe, combo) for combo in combinations]
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        future_to_combo = {executor.submit(_run_test4_case, task): task[3] for task in tasks}
+
+        for count, future in enumerate(as_completed(future_to_combo), start=1):
+            combo = future_to_combo[future]
+            jitter, p_gb, p_bb, ber = combo
+            print(
+                f"  [{count}/{total}] Jitter={jitter}ms, P(G→B)={p_gb}, P(B→B)={p_bb}, BER={ber:.0e}",
+                end=" ... ",
+            )
+
+            try:
+                combo_result, pesq_score = future.result()
+            except Exception as exc:
+                print(f"FALHA ({exc})")
+                continue
+
+            if pesq_score is not None:
+                results.append((combo_result, pesq_score))
+                print(f"PESQ: {pesq_score:.4f}")
+            else:
+                print("FALHA")
     
     return results
 
@@ -385,6 +497,14 @@ def build_parser():
                         help="Tipos de teste para pular (1-4), ex.: --skip-tests 2 4")
     parser.add_argument("--repetitions", type=int, default=DEFAULT_REPETITIONS,
                         help=f"Número de repetições para média dos testes 1-3 (padrão: {DEFAULT_REPETITIONS})")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help=f"Número de processos para o Teste 4 (padrão: {DEFAULT_WORKERS})")
+    parser.add_argument("--test4-mode", choices=["reduced-grid", "lhs", "full"], default="reduced-grid",
+                        help="Estratégia de amostragem para o Teste 4")
+    parser.add_argument("--test4-grid-levels", type=int, default=DEFAULT_TEST4_GRID_LEVELS,
+                        help=f"Quantos níveis usar em cada eixo no modo reduced-grid (padrão: {DEFAULT_TEST4_GRID_LEVELS})")
+    parser.add_argument("--test4-samples", type=int, default=DEFAULT_TEST4_LHS_SAMPLES,
+                        help=f"Quantidade de amostras no modo lhs (padrão: {DEFAULT_TEST4_LHS_SAMPLES})")
     
     return parser
 
@@ -413,6 +533,18 @@ def main():
 
     if args.repetitions < 1:
         print("Erro: --repetitions deve ser >= 1", file=sys.stderr)
+        sys.exit(1)
+
+    if args.workers < 1:
+        print("Erro: --workers deve ser >= 1", file=sys.stderr)
+        sys.exit(1)
+
+    if args.test4_grid_levels < 1:
+        print("Erro: --test4-grid-levels deve ser >= 1", file=sys.stderr)
+        sys.exit(1)
+
+    if args.test4_samples < 1:
+        print("Erro: --test4-samples deve ser >= 1", file=sys.stderr)
         sys.exit(1)
     
     test_type = args.test_type if args.test_type in [1, 2, 3, 4] else 0
@@ -445,7 +577,16 @@ def main():
         plot_results(results, args.output_dir, 3)
     
     if 4 in tests_to_run:
-        results = test_type_4(args.input_wav, args.ttdv_path, args.pesq_exe, args.output_dir)
+        results = test_type_4(
+            args.input_wav,
+            args.ttdv_path,
+            args.pesq_exe,
+            args.output_dir,
+            args.test4_mode,
+            args.test4_grid_levels,
+            args.test4_samples,
+            args.workers,
+        )
         save_results(results, args.output_dir, 4)
         plot_results(results, args.output_dir, 4)
     
